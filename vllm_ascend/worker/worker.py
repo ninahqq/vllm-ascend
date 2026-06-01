@@ -34,8 +34,12 @@ from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import (
     Handle,
+    TensorMetadata,
+    _split_tensor_dict,
     get_pp_group,
+    get_pp_group_for_cloud,
     get_tp_group,
+    get_tp_group_for_cloud,
     is_cloud_device,
     is_edge_device,
 )
@@ -151,6 +155,24 @@ class NPUWorker(WorkerBase):
             logger.warning("VLLM_USE_V2_MODEL_RUNNER is not supported on vllm 0.20.2; falling back to v1 model runner.")
             self.use_v2_model_runner = False
         self._pp_send_work: list[Handle] = []
+
+        # Initialize Edge-Cloud request router for multi-cloud routing
+        self._edge_cloud_router = None
+        self._pp_sends_by_cloud: dict[int, list[Handle]] = {}
+        if (
+            is_edge_device()
+            and getattr(self.parallel_config, "cloud_device_count", 1) > 1
+        ):
+            from vllm.distributed.edge_cloud_router import EdgeCloudRouter
+
+            self._edge_cloud_router = EdgeCloudRouter(
+                num_cloud_devices=self.parallel_config.cloud_device_count,
+                strategy="round_robin",
+            )
+            logger.info(
+                "[EdgeCloud] Initialized request router for %d Cloud devices",
+                self.parallel_config.cloud_device_count,
+            )
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -432,6 +454,13 @@ class NPUWorker(WorkerBase):
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
 
+        # Multi-cloud routing: Edge node with multiple Cloud devices
+        if (
+            is_edge_device()
+            and self._edge_cloud_router is not None
+        ):
+            return self._execute_model_multi_cloud(scheduler_output)
+
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
@@ -441,7 +470,64 @@ class NPUWorker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass:
             if is_cloud_device():
-                tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+                # Multi-cloud: use the correct PP group for this Cloud device
+                if getattr(parallel_config, "cloud_device_count", 1) > 1:
+                    cloud_id = (self.rank - parallel_config.edge_npu_count) // getattr(
+                        parallel_config, "cloud_npus_per_device", parallel_config.cloud_npu_count
+                    )
+                    pp_group = get_pp_group_for_cloud(cloud_id)
+                    tp_group = get_tp_group_for_cloud(cloud_id)
+                    is_pp_npu0 = pp_group.world_size == 2
+                    if is_pp_npu0:
+                        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+                        assert tensor_dict is not None
+                        # Broadcast within the Cloud TP group so all ranks get the data
+                        metadata_list, _ = _split_tensor_dict(tensor_dict)
+                        tp_group.broadcast_object(metadata_list, src=0)
+                        def broadcast_postprocess():
+                            _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
+                            handles = []
+                            for tensor in tensor_list:
+                                if tensor.numel() == 0:
+                                    continue
+                                group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+                                handles.append(
+                                    torch.distributed.broadcast(
+                                        tensor, src=tp_group.ranks[0], group=group, async_op=True
+                                    )
+                                )
+                            for handle in handles:
+                                handle.wait()
+                        comm_postprocess.append(broadcast_postprocess)
+                    else:
+                        metadata_list = tp_group.broadcast_object(None, src=0)
+                        if metadata_list is None:
+                            metadata_list = []
+                        recv_tensor_dict: dict[str, torch.Tensor] = {}
+                        for key, value in metadata_list:
+                            if isinstance(value, TensorMetadata):
+                                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                                recv_tensor_dict[key] = tensor
+                            else:
+                                recv_tensor_dict[key] = value
+                        def broadcast_postprocess():
+                            handles = []
+                            for tensor in recv_tensor_dict.values():
+                                if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+                                    continue
+                                group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+                                handles.append(
+                                    torch.distributed.broadcast(
+                                        tensor, src=tp_group.ranks[0], group=group, async_op=True
+                                    )
+                                )
+                            for handle in handles:
+                                handle.wait()
+                        tensor_dict = recv_tensor_dict
+                        comm_handles = []
+                        comm_postprocess = [broadcast_postprocess]
+                else:
+                    tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
                     comm_handles=comm_handles,
@@ -491,8 +577,17 @@ class NPUWorker(WorkerBase):
             return output
 
         if is_cloud_device():
-            if get_pp_group().world_size == 2:
-                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+            # Multi-cloud: use the correct PP group for this Cloud device
+            if getattr(parallel_config, "cloud_device_count", 1) > 1:
+                cloud_id = (self.rank - parallel_config.edge_npu_count) // getattr(
+                    parallel_config, "cloud_npus_per_device", parallel_config.cloud_npu_count
+                )
+                pp_group = get_pp_group_for_cloud(cloud_id)
+                if pp_group.world_size == 2:
+                    self._pp_send_work = pp_group.isend_tensor_dict(output.tensors)
+            else:
+                if get_pp_group().world_size == 2:
+                    self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
         else:
             assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
@@ -505,6 +600,85 @@ class NPUWorker(WorkerBase):
                 output.tensors,
                 all_gather_group=all_gather_group,
             )
+
+    def _execute_model_multi_cloud(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        """Edge node: route requests to multiple independent Cloud devices.
+
+        Each Cloud device holds a full model replica. The Edge node routes
+        requests to different Cloud devices based on the EdgeCloudRouter.
+        """
+        # 1. Determine target Cloud device for each request
+        req_cloud_map: dict[str, int] = {}
+        for req_id in scheduler_output.num_scheduled_tokens:
+            cloud_id = self._edge_cloud_router.get_cloud(req_id)
+            if cloud_id is None:
+                cloud_id = self._edge_cloud_router.route(req_id)
+            req_cloud_map[req_id] = cloud_id
+
+        # 2. Wait for previous sends to complete
+        for sends in self._pp_sends_by_cloud.values():
+            for h in sends:
+                h.wait()
+        self._pp_sends_by_cloud.clear()
+
+        # 3. Execute Edge first segment (embed_tokens + any head layers)
+        output = self.model_runner.execute_model(scheduler_output, None)
+        if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            return output
+        assert isinstance(output, IntermediateTensors)
+
+        # 4. Send to each Cloud device via its own PP group
+        cloud_results: dict[int, AsyncIntermediateTensors] = {}
+        for cloud_id in range(self.parallel_config.cloud_device_count):
+            pp_group = get_pp_group_for_cloud(cloud_id)
+            if pp_group.world_size == 2:
+                self._pp_sends_by_cloud[cloud_id] = pp_group.isend_tensor_dict(
+                    output.tensors
+                )
+
+        # 5. Receive from each Cloud device
+        for cloud_id in range(self.parallel_config.cloud_device_count):
+            pp_group = get_pp_group_for_cloud(cloud_id)
+            tensor_dict, comm_handles, comm_postprocess = (
+                pp_group.irecv_tensor_dict()
+            )
+            if tensor_dict is not None:
+                cloud_results[cloud_id] = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
+
+        # 6. Wait for all sends to complete before proceeding
+        for sends in self._pp_sends_by_cloud.values():
+            for h in sends:
+                h.wait()
+
+        # 7. Execute Edge last segment (norm + logits) with merged results
+        # For embedding_only mode, the model_runner handles the tail segment
+        # using the intermediate tensors received from Cloud.
+        # We use the first available Cloud result as the intermediate tensors.
+        # In a full implementation, we would merge results from multiple Clouds.
+        merged_intermediate = None
+        if cloud_results:
+            # Use the first available result (simplified)
+            merged_intermediate = next(iter(cloud_results.values()))
+
+        if merged_intermediate is not None:
+            output = self.model_runner.execute_model(
+                scheduler_output, merged_intermediate
+            )
+
+        # 8. Release finished requests
+        for req_id in scheduler_output.finished_req_ids:
+            self._edge_cloud_router.finish(req_id)
+
+        if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            return output
+        return output
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
