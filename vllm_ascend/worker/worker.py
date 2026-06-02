@@ -499,6 +499,7 @@ class NPUWorker(WorkerBase):
                             for handle in handles:
                                 handle.wait()
                         comm_postprocess.append(broadcast_postprocess)
+                        print(f"cloudid = {cloud_id}, cloud 0 recv from edge, tensor = {tensor_dict}")
                     else:
                         metadata_list = tp_group.broadcast_object(None, src=0)
                         if metadata_list is None:
@@ -526,6 +527,7 @@ class NPUWorker(WorkerBase):
                         tensor_dict = recv_tensor_dict
                         comm_handles = []
                         comm_postprocess = [broadcast_postprocess]
+                        print(f"cloudid = {cloud_id}, cloud recv from TP greoup, tensor = {tensor_dict}")
                 else:
                     tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
                 intermediate_tensors = AsyncIntermediateTensors(
@@ -565,12 +567,14 @@ class NPUWorker(WorkerBase):
         if is_edge_device():
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+            print(f"edge send to cloud: tensor={output.tensors}")
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
+            print(f"edge recv from cloud: intermediate_tensors={intermediate_tensors}")
             output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
             if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
                 return output
