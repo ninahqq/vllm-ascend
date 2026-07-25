@@ -524,6 +524,7 @@ class SharedModelEdgeWorker(NPUWorker):
         rank: int,
         distributed_init_method: str,
         is_driver_worker: bool = False,
+        global_dp_rank: int | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -534,17 +535,11 @@ class SharedModelEdgeWorker(NPUWorker):
             is_driver_worker=is_driver_worker,
             **kwargs,
         )
-        # ``SharedModelEdgeWorker`` is only valid in the
-        # shared-model edge-cloud topology: the worker must be on
-        # the edge side and the edge must have exactly one NPU
-        # (i.e. ``is_shared_model_edge`` is True). Using this
-        # worker on the cloud side, or on a multi-NPU edge, would
-        # silently produce incorrect PP routing.
+        # ``SharedModelEdgeWorker`` is valid only on a shared edge group.
         if not vllm_config.parallel_config.is_shared_model_edge:
             raise RuntimeError(
                 "SharedModelEdgeWorker can only be used in the "
-                "shared-model edge-cloud topology "
-                "(edge_npu_count == 1 across the whole world). "
+                "shared-model edge-cloud topology. "
                 "The current parallel_config has "
                 f"is_shared_model_edge=False "
                 f"(edge_npu_count="
@@ -560,7 +555,13 @@ class SharedModelEdgeWorker(NPUWorker):
                 "edge-cloud configuration; the current process has "
                 "is_edge_node=False. Use a regular NPUWorker on the "
                 "cloud side.")
-        # local_rank doubles as the worker's dp_rank in this design.
+        self.global_dp_rank = (
+            local_rank if global_dp_rank is None else global_dp_rank
+        )
+        self.edge_group_id = (
+            vllm_config.parallel_config.edge_group_id(self.global_dp_rank)
+        )
+        # local_rank is the virtual rank within this physical edge group.
         self._is_leader: bool = (self.local_rank == 0)
         # Published by the leader in load_model; read by followers.
         self._shared_model: nn.Module | None = None
@@ -645,11 +646,22 @@ class SharedModelEdgeWorker(NPUWorker):
         """Run the HCCL-backend distributed init once per process.
 
         Only the leader invokes the upstream machinery; followers inherit
-        the process-level distributed state.
+        the process-level distributed state. The process sees exactly one
+        physical edge NPU through the device-control environment, so its
+        device-local rank must remain zero even when the group leader's global
+        DP rank is non-zero (for example DP2 leading edge group 1).
         """
         if not self._is_leader:
             return
-        super()._init_worker_distributed_environment()
+        original_local_rank = self.parallel_config.data_parallel_rank_local
+        original_index = self.parallel_config.data_parallel_index
+        try:
+            self.parallel_config.data_parallel_rank_local = 0
+            self.parallel_config.data_parallel_index = 0
+            super()._init_worker_distributed_environment()
+        finally:
+            self.parallel_config.data_parallel_rank_local = original_local_rank
+            self.parallel_config.data_parallel_index = original_index
 
     # --------------------------------------------------------- model load
     def load_model(self) -> None:
@@ -673,7 +685,12 @@ class SharedModelEdgeWorker(NPUWorker):
                     "in local_rank order so the leader's load_model runs "
                     "before any follower's."
                 )
-            self.model_runner.bind_to_shared_model(leader._shared_model)
+            self.model_runner.bind_to_shared_model(
+                leader._shared_model,
+                source_compilation_config=(
+                    leader.model_runner.compilation_config
+                ),
+            )
             self._shared_model = leader._shared_model
             # Inherit the leader's measured model memory usage so that
             # determine_available_memory can correctly subtract the
@@ -917,11 +934,13 @@ class SharedModelEdgeWorker(NPUWorker):
                 return w._per_worker_kv_cache_memory
 
         # Slow path: we are the first caller. Do the actual
-        # profiling and divide by dp_size.
+        # profiling and divide by the number of virtual DP workers sharing
+        # this physical edge NPU.
+        group_size = self.parallel_config.dp_ranks_per_edge_group
         if self.cache_config.kv_cache_memory_bytes:
             self._per_worker_kv_cache_memory = int(
                 self.cache_config.kv_cache_memory_bytes
-                // self.parallel_config.data_parallel_size)
+                // group_size)
             return self._per_worker_kv_cache_memory
 
         from vllm.utils.mem_utils import memory_profiling
@@ -945,7 +964,7 @@ class SharedModelEdgeWorker(NPUWorker):
                 "Error in memory profiling: free memory increased.")
         available = int(self.requested_memory - result.non_kv_cache_memory)
         self._per_worker_kv_cache_memory = (
-            available // self.parallel_config.data_parallel_size)
+            available // group_size)
         # For embedding_only edge, the edge device does not actually store KV
         # cache tensors. Return a very large virtual value so that
         # get_kv_cache_configs() does not clamp num_blocks to the edge's

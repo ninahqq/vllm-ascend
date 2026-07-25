@@ -1009,17 +1009,22 @@ class NPUWorker(WorkerBase):
             not in ("ray", "external_launcher")
             and parallel_config.data_parallel_backend != "ray"
             and parallel_config.data_parallel_size > 1
+            and not parallel_config.enable_edge_cloud
         ):
             # Use local DP rank if available, otherwise use global DP rank.
             dp_local_rank = parallel_config.data_parallel_rank_local
             if dp_local_rank is None:
                 dp_local_rank = parallel_config.data_parallel_index
 
-            # In edge-cloud mode, local_world_size = edge_npu_count or cloud_npu_count
-            # Use local_world_size as the stride per DP instance
             local_world_size = parallel_config.local_world_size
             # DP_LOCAL_RANK * LOCAL_WORLD_SIZE + TP_LOCAL_RANK
             local_rank += dp_local_rank * local_world_size
+        # Edge-cloud executors run with a DP-specific visible-device shard:
+        # edge EngineCores narrow the environment before spawning workers,
+        # while headless cloud instances expose only that DP's cloud devices.
+        # Therefore self.local_rank is already the correct device-local rank.
+        # Adding the global DP offset here would turn cloud DP1/2/3 ranks into
+        # 2..7 even though each process sees only devices 0..C-1.
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, local_rank, "hccl"
         )

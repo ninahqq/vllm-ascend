@@ -391,13 +391,17 @@ def init_ascend_model_parallel(
         edge_npu_count = parallel_config.edge_npu_count
         cloud_npu_count = parallel_config.cloud_npu_count
         if parallel_config.is_shared_model_edge:
-            # Shared-model edge-cloud topology: the edge has a
-            # single distributed rank (rank 0) and the cloud
-            # occupies ranks 1..1 + N*C.
-            ep_edge_ranks = [0]
+            # Shared-model edge-cloud topology: physical edge replicas occupy
+            # the leading ranks and cloud ranks follow them.
+            edge_group_count = parallel_config.edge_shared_group_count
+            ep_edge_ranks = list(range(edge_group_count))
             ep_cloud_ranks = list(
-                range(1,
-                      1 + parallel_config.data_parallel_size * cloud_npu_count))
+                range(
+                    edge_group_count,
+                    edge_group_count
+                    + parallel_config.data_parallel_size * cloud_npu_count,
+                )
+            )
         else:
             world_size_per_instance = edge_npu_count + cloud_npu_count
             ep_edge_ranks = []
