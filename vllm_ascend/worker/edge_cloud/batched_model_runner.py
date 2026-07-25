@@ -585,6 +585,10 @@ class BatchedModelRunner(NPUModelRunner):
         return num_tokens, None, cudagraph_mode
     # ------------------------------------------------------------------
     # Batched compute entry points
+    #
+    # These methods split NPUModelRunner.execute_model into independently
+    # dispatched phases. Each phase must therefore establish the inference
+    # mode that the original monolithic entry point provided.
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def execute_model_pre(
