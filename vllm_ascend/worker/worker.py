@@ -550,13 +550,10 @@ class NPUWorker(WorkerBase):
                 # rather than the implicit "previous PP rank"
                 # (which would not point at the edge for cloud
                 # first-workers past the first one).
-                # Match the sender: only receive mrope when this batch has a
-                # multimodal request (text-only batches compute M-RoPE on
-                # cloud locally). Computed from the same scheduler_output the
-                # edge used, so both sides agree.
-                cloud_include_mrope = self.model_runner.step_has_multimodal_req(
-                    scheduler_output
-                )
+                # 修改原因：边云 request cache 生命周期不同，分别动态推导是否接收
+                # M-RoPE 会造成 sender/receiver key 集不一致并死锁。
+                # 修改内容：云侧对 M-RoPE 模型始终按固定 schema 发起接收。
+                cloud_include_mrope = self.model_runner.uses_mrope
                 tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
                     sp_chunk=do_sp_chunk and merge_payload,
@@ -619,12 +616,10 @@ class NPUWorker(WorkerBase):
             # (and hitting the missing grid_thw). Transpose [3, N] -> [N, 3]
             # so the sequence axis is dim-0, matching hidden_states and the
             # e2c transfer's dim-0 slicing / SP-gather path.
-            # Skip for text-only batches: cloud computes M-RoPE locally then
-            # (empty mm_features degrades to 1D, no grid_thw needed), saving
-            # one P2P RTT.
-            include_mrope = self.model_runner.step_has_multimodal_req(
-                scheduler_output
-            )
+            # 修改原因：动态省略 position 的通信收益很小，却会引入协议分支和
+            # 边云状态不一致风险。
+            # 修改内容：边侧对 M-RoPE 模型所有 step 固定附加 [N,3] position。
+            include_mrope = self.model_runner.uses_mrope
             if (include_mrope and self.model_runner.uses_mrope
                     and "hidden_states" in _gathered):
                 n = _gathered["hidden_states"].shape[0]
@@ -999,17 +994,19 @@ class NPUWorker(WorkerBase):
             not in ("ray", "external_launcher")
             and parallel_config.data_parallel_backend != "ray"
             and parallel_config.data_parallel_size > 1
+            and not parallel_config.enable_edge_cloud
         ):
             # Use local DP rank if available, otherwise use global DP rank.
             dp_local_rank = parallel_config.data_parallel_rank_local
             if dp_local_rank is None:
                 dp_local_rank = parallel_config.data_parallel_index
 
-            # In edge-cloud mode, local_world_size = edge_npu_count or cloud_npu_count
-            # Use local_world_size as the stride per DP instance
             local_world_size = parallel_config.local_world_size
             # DP_LOCAL_RANK * LOCAL_WORLD_SIZE + TP_LOCAL_RANK
             local_rank += dp_local_rank * local_world_size
+        # 修改原因：边云 executor 已为每个 DP 限定可见设备；此处再叠加全局 DP
+        # 偏移会把 cloud DP1/2/3 的局部设备号错误变成 2..7。
+        # 修改内容：非边云模式保留原 DP offset，边云模式直接使用已有 local_rank。
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, local_rank, "hccl"
         )

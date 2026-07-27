@@ -2743,8 +2743,12 @@ class NPUModelRunner(GPUModelRunner):
             if (self._edge_cloud_enabled
                     and self.edge_cloud_cfg.role == "cloud"
                     and self.uses_mrope
-                    and self.step_has_multimodal_req(scheduler_output)
-                    and recv_intermediate_tensors is not None):
+                    and recv_intermediate_tensors is not None
+                    and "mrope_positions" in recv_intermediate_tensors.tensors):
+                # 修改原因：云侧缺少 image/video grid，不能重算多模态 M-RoPE；
+                # 固定 wire schema 后应以实际收到的字段为准，而非再次依赖本地
+                # request 分类。
+                # 修改内容：等待通信完成并把 edge position 写入云侧 staging buffer。
                 recv_intermediate_tensors.wait_for_comm()
                 recv_mrope = recv_intermediate_tensors.tensors["mrope_positions"]
                 self.mrope_positions.gpu[:, :num_tokens_padded].copy_(
@@ -4027,19 +4031,24 @@ class NPUModelRunner(GPUModelRunner):
         }
 
     def step_has_multimodal_req(self, scheduler_output) -> bool:
-        """Whether the current step's batch contains any multimodal request.
+        """判断当前 scheduler step 是否包含多模态请求。
 
-        Used to decide whether mrope_positions must be transferred edge->cloud
-        (only multimodal requests need it; text-only batches can be computed
-        locally on the cloud because empty mm_features degrades M-RoPE to 1D
-        without hitting the missing image_grid_thw). Must return the SAME value
-        on edge and cloud (they share the scheduler_output and build req_state
-        from the same NewRequestData.mm_features).
+        修改原因：mm_features 可能被 IPC cache 引用替换，且扫描全部 resident
+        request 会把未调度的多模态请求错误传播到当前纯文本 step。
+        修改内容：优先检查 scheduler 的 encoder schedule，再只检查当前 step
+        调度的 cached/new request。M-RoPE wire schema 本身不依赖此判断。
         """
-        # cached/running reqs: covers decode of multimodal requests (whose
-        # mm_features stay non-empty after prefill).
-        if any(rs.mm_features for rs in self.requests.values()):
+        # 修改原因：scheduled_encoder_inputs 是边云两侧一致的 scheduler 信号，
+        # 比可能被替换/裁剪的 worker-local mm_features 更可靠。
+        # 修改内容：将其作为本轮视觉 Encoder 输入的第一判断依据。
+        if scheduler_output.scheduled_encoder_inputs:
             return True
+        # 修改原因：扫描全部 resident request 会让无关多模态请求污染文本 step。
+        # 修改内容：仅遍历当前 num_scheduled_tokens 中实际执行的 request id。
+        for req_id in getattr(scheduler_output, "num_scheduled_tokens", {}):
+            req_state = self.requests.get(req_id)
+            if req_state is not None and req_state.mm_features:
+                return True
         # new reqs this step: cloud recv runs BEFORE cloud_prepare_early builds
         # req_state, so on the cloud side self.requests does not yet contain
         # this step's new reqs; check scheduler_output directly.
@@ -4052,9 +4061,9 @@ class NPUModelRunner(GPUModelRunner):
         # In edge-cloud cloud mode: skip M-RoPE init only for multimodal
         # requests (their image_grid_thw / video_grid_thw did not cross the
         # edge->cloud mm_features boundary, so local init would KeyError).
-        # Text-only requests (empty mm_features) init locally: _iter_mm_grid_hw
-        # does not enter its loop, M-RoPE degrades to 1D, no crash. This lets
-        # text-only batches skip the mrope transfer entirely.
+        # 修改原因：云侧多模态请求没有 grid_thw，初始化会 KeyError；纯文本没有
+        # grid 遍历需求，可安全退化成 1D position。
+        # 修改内容：只跳过云侧多模态 request 的本地 M-RoPE 初始化。
         # profile_run / _dummy_run do not call this, so the role guard does not
         # affect profiling.
         if (self._edge_cloud_enabled

@@ -241,7 +241,10 @@ class BatchedModelRunner(NPUModelRunner):
             # the same for every virtual worker on the edge since
             # they all share the same NPU). The model_runner only
             # READS the registry here.
-            dp_size = self.parallel_config.data_parallel_size
+            # 修改原因：本进程的 KV 配置注册表只包含当前物理 edge group 中的
+            # 虚拟 DP，使用全局 DP 数会等待永远不会注册的其他组。
+            # 修改内容：按每个 edge group 实际承载的 DP 数检查配置是否齐备。
+            dp_size = self.parallel_config.dp_ranks_per_edge_group
             if (len(
                     BatchedModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK)
                     < dp_size):
@@ -429,8 +432,16 @@ class BatchedModelRunner(NPUModelRunner):
             len(kv_cache_config_per_dp))
         return kv_caches
 
-    def bind_to_shared_model(self, model: nn.Module) -> None:
-        """Bind this runner to a model object loaded by another runner.
+    def bind_to_shared_model(
+        self,
+        model: nn.Module,
+        source_compilation_config: Any | None = None,
+    ) -> None:
+        """绑定由 leader 加载的共享模型对象。
+
+        修改原因：follower 不加载权重，但其自定义算子仍需 leader 创建的静态
+        forward context。
+        修改内容：新增可选 source_compilation_config，并复用其中的层注册信息。
 
         Used by ``SharedModelEdgeWorker`` follower workers to share a single
         ``nn.Module`` instance across multiple model runners in the same
@@ -450,9 +461,25 @@ class BatchedModelRunner(NPUModelRunner):
         - ensuring ``model`` has already been fully loaded by another
           runner in the same process (i.e. the leader
           ``SharedModelEdgeWorker``);
+        - passing the leader's ``CompilationConfig`` so that custom ops
+          resolve layer names against the same static forward context as
+          the shared model;
         - assigning ``self.model_memory_usage`` after binding, because only
           the leader's profile run actually measures it.
         """
+        if source_compilation_config is not None:
+            # 修改原因：每个虚拟 DP 有独立 VllmConfig，但只有 leader 真正构建
+            # 模型并填充 static forward context；follower 的 GDN/Attention/MoE
+            # 若使用空 context 将无法定位共享模型层。
+            # 修改内容：follower 绑定模型时同时复用 leader 的静态层上下文和
+            # MoE 层列表。
+            self.compilation_config.static_forward_context = (
+                source_compilation_config.static_forward_context
+            )
+            self.compilation_config.static_all_moe_layers = (
+                source_compilation_config.static_all_moe_layers
+            )
+
         self.model = model
 
         # Edge-cloud specific state, derived from the (already sharded) model.
@@ -561,6 +588,9 @@ class BatchedModelRunner(NPUModelRunner):
         return num_tokens, None, cudagraph_mode
     # ------------------------------------------------------------------
     # Batched compute entry points
+    # 修改原因：这些方法把原本单体 execute_model 拆成可独立 dispatch 的阶段，
+    # 装饰器的 inference mode 不会自动跨函数边界继承。
+    # 修改内容：每个阶段入口单独建立 inference mode，避免意外构建 autograd 图。
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def execute_model_pre(
@@ -592,6 +622,31 @@ class BatchedModelRunner(NPUModelRunner):
         doesn't reuse the segment_e fast path — every round runs
         a fresh ``execute_model_pre``).
         """
+        # 修改原因：cached request 在当前虚拟 Worker 中不存在，说明 new/cached
+        # step 被路由到不同 DP 或发生乱序；继续执行只会抛出无上下文的 KeyError。
+        # 修改内容：输入准备前校验 request ownership，并输出 global/local DP
+        # 及 new/cached/known request id 方便定位。
+        new_req_ids = {
+            req_data.req_id
+            for req_data in scheduler_output.scheduled_new_reqs
+        }
+        cached_req_ids = set(
+            scheduler_output.scheduled_cached_reqs.req_ids)
+        missing_cached_req_ids = cached_req_ids - self.requests.keys()
+        if missing_cached_req_ids:
+            raise RuntimeError(
+                "Shared-model virtual DP request state is out of sync: "
+                f"global_dp_rank="
+                f"{self.parallel_config.data_parallel_rank}, "
+                f"local_dp_rank="
+                f"{self.parallel_config.data_parallel_rank_local}, "
+                f"missing_cached_req_ids={sorted(missing_cached_req_ids)}, "
+                f"new_req_ids={sorted(new_req_ids)}, "
+                f"cached_req_ids={sorted(cached_req_ids)}, "
+                f"known_req_ids={sorted(self.requests)}. "
+                "The cached execute step must be routed to the same virtual "
+                "worker that handled the request's new-request step.")
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -839,11 +894,23 @@ class BatchedModelRunner(NPUModelRunner):
                 "_build_attn_group_metadata (via "
                 "_should_save_for_attn_metadata=True).")
         common_attn_metadata = cm_base
+        # 修改原因：runner 的 M-RoPE staging buffer 会被下一次异步 prepare 覆盖，
+        # PP 发送阶段再读取可能拿到下一 step 的 position。
+        # 修改内容：在 bundle 创建时复制真实 token 范围，并转成通信所需 [N,3]。
+        mrope_positions = None
+        if self.uses_mrope:
+            num_actual_tokens = scheduler_output.total_num_scheduled_tokens
+            mrope_positions = (
+                self.mrope_positions.gpu[
+                    :, :num_actual_tokens
+                ].t().contiguous()
+            )
 
         return _ExecuteModelBundle(
             input_ids=input_ids,
             positions=positions,
             inputs_embeds=inputs_embeds,
+            mrope_positions=mrope_positions,
             intermediate_tensors=None,
             hidden_states=None,
             logits_indices=logits_indices,
@@ -866,6 +933,51 @@ class BatchedModelRunner(NPUModelRunner):
                 deferred_state_corrections_fn),
         )
 
+    @staticmethod
+    def _validate_batched_forward_inputs(
+        bundles: list[_ExecuteModelBundle],
+    ) -> None:
+        """拒绝不能进入同一次模型 forward 的输入布局。
+
+        修改原因：纯文本 input_ids、多模态 inputs_embeds 或不同 position 维度
+        直接拼接会产生错误结果或深层 shape 异常。
+        修改内容：合批前统一校验输入类型存在且一致、position 布局一致。
+        """
+        if not bundles:
+            raise RuntimeError(
+                "Virtual-DP batched forward requires at least one bundle."
+            )
+
+        input_kinds = {
+            (
+                "embeds"
+                if bundle.inputs_embeds is not None
+                else "ids"
+                if bundle.input_ids is not None
+                else "missing"
+            )
+            for bundle in bundles
+        }
+        if len(input_kinds) != 1 or "missing" in input_kinds:
+            raise RuntimeError(
+                "Virtual-DP batched forward received incompatible input "
+                f"kinds: {sorted(input_kinds)}."
+            )
+
+        position_dims = {
+            bundle.positions.dim()
+            for bundle in bundles
+            if bundle.positions is not None
+        }
+        if (
+            len(position_dims) != 1
+            or any(bundle.positions is None for bundle in bundles)
+        ):
+            raise RuntimeError(
+                "Virtual-DP batched forward received incompatible position "
+                f"layouts: dims={sorted(position_dims)}."
+            )
+
     @torch.inference_mode()
     def execute_model_batched_head(
         self,
@@ -884,6 +996,10 @@ class BatchedModelRunner(NPUModelRunner):
         ``self.max_num_tokens`` in the ``embedding_only`` mode so
         that the cloud's pre-allocated buffer is large enough.
         """
+        # 修改原因：合并 tensor 前必须把不兼容 round 转成可定位的显式错误。
+        # 修改内容：统一执行输入类型和 position layout 校验。
+        self._validate_batched_forward_inputs(bundles)
+
         # Per-bundle actual (non-padded) token counts.
         n_actuals = [b.num_actual_tokens for b in bundles]
 
@@ -1559,7 +1675,10 @@ class BatchedModelRunner(NPUModelRunner):
             AscendAttentionState,
         )
 
-        dp_size = self.parallel_config.data_parallel_size
+        # 修改原因：合并 attention/KV state 的范围是当前物理 edge group，而非
+        # 全局所有 DP。
+        # 修改内容：按组内虚拟 DP 数分配和遍历合并状态。
+        dp_size = self.parallel_config.dp_ranks_per_edge_group
         bs = self.block_size
         num_kv_cache_gids = len(self.kv_cache_config.kv_cache_groups)
 
@@ -2399,4 +2518,3 @@ class BatchedModelRunner(NPUModelRunner):
         )
         self._merged_attn_ctx_cache = ctx
         return ctx
-

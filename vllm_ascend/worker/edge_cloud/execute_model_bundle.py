@@ -73,6 +73,11 @@ class _ExecuteModelBundle:
     input_ids: torch.Tensor | None
     positions: torch.Tensor | None
     inputs_embeds: torch.Tensor | None
+    # 修改原因：positions 可能只是 runner staging buffer 的 view，异步准备下一
+    # step 后会被覆盖，导致边云发送错误的多模态位置。
+    # 修改内容：保存当前虚拟 DP、真实 token 范围、sequence-major [N,3] 的
+    # 不可变 M-RoPE 快照，生命周期覆盖到本轮 PP send 发起完成。
+    mrope_positions: torch.Tensor | None
     intermediate_tensors: IntermediateTensors | None
     hidden_states: torch.Tensor | None
 

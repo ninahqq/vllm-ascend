@@ -377,13 +377,18 @@ def init_ascend_model_parallel(
         edge_npu_count = parallel_config.edge_npu_count
         cloud_npu_count = parallel_config.cloud_npu_count
         if parallel_config.is_shared_model_edge:
-            # Shared-model edge-cloud topology: the edge has a
-            # single distributed rank (rank 0) and the cloud
-            # occupies ranks 1..1 + N*C.
-            ep_edge_ranks = [0]
+            # 修改原因：共享模型拓扑中边侧物理 rank 数是共享组数，不再等于
+            # data_parallel_size。
+            # 修改内容：全部 edge replicas 占前置 rank，cloud ranks 顺序后移。
+            edge_group_count = parallel_config.edge_shared_group_count
+            ep_edge_ranks = list(range(edge_group_count))
             ep_cloud_ranks = list(
-                range(1,
-                      1 + parallel_config.data_parallel_size * cloud_npu_count))
+                range(
+                    edge_group_count,
+                    edge_group_count
+                    + parallel_config.data_parallel_size * cloud_npu_count,
+                )
+            )
         else:
             world_size_per_instance = edge_npu_count + cloud_npu_count
             ep_edge_ranks = []
@@ -748,11 +753,11 @@ def edge_cloud_isend_tensor_dict(
             etc.). When ``None``, tensors are sent as-is preserving the
             previous behavior for callers that already guarantee unpadded
             output.
-        include_mrope: when False, omit ``mrope_positions`` from the wire
-            payload (text-only batches compute M-RoPE locally on the cloud,
-            so transferring it would waste a P2P RTT). The caller on both
-            sides must pass the same value (derived from
-            step_has_multimodal_req) so sender/receiver agree on the key set.
+        include_mrope: 是否在通信载荷中包含 ``mrope_positions``。
+            修改原因：按两侧本地请求状态动态增删字段会造成 isend/irecv key
+            集不一致并触发 HCCL 死等。
+            修改内容：M-RoPE 模型固定传输该字段；兼容调用方仅可在收发两侧
+            配置完全一致时关闭。
     """
     pp_group = get_pp_group()
     if pp_group.world_size <= 1:
@@ -772,10 +777,8 @@ def edge_cloud_isend_tensor_dict(
     # mismatch would corrupt data silently or only surface as an HCCL
     # crash. Fail fast here with a precise message instead.
     ec_meta = _select_edge_cloud_meta_for_send()
-    # Dynamic send key set: drop mrope_positions when the caller signals a
-    # text-only batch (include_mrope=False). Both sides derive include_mrope
-    # from the same step_has_multimodal_req(scheduler_output), so sender and
-    # receiver agree on whether mrope is on the wire.
+    # 修改原因：多模态 request state 在边云两侧建立时机不同，动态 key 集不可靠。
+    # 修改内容：M-RoPE Worker 使用固定 wire schema；保留开关仅用于兼容调用。
     meta_send_keys = ec_meta.send_tensor_keys or ec_meta.tensor_keys
     send_keys = [
         k for k in meta_send_keys
@@ -1070,7 +1073,9 @@ def edge_cloud_irecv_tensor_dict(
         if key in merge_key_set:
             continue  # already covered by the merged buffer
         if key == "mrope_positions" and not include_mrope:
-            # Sender omitted mrope for this text-only batch; do not allocate
+            # 修改原因：兼容模式下 sender 明确省略该字段，receiver 必须同步跳过，
+            # 否则会多发起一个永远等不到的 irecv。
+            # 修改内容：不分配也不接收 mrope_positions。
             # or irecv it (cloud computes M-RoPE locally).
             continue
         # Replace the placeholder dim-0 with the TP-padded size; the
@@ -1181,9 +1186,9 @@ def edge_cloud_broadcast_recv(
             in the PP receive); the singleton-PP TP-broadcast-only
             branch is unchanged.
 
-    include_mrope: must match the sender's edge_cloud_isend_tensor_dict
-    argument (both derived from step_has_multimodal_req). When False,
-    mrope_positions is neither received nor broadcast (text-only batch).
+    include_mrope: 必须与发送端参数一致。
+        修改原因：接收及节点内 broadcast 的 tensor key 数量必须与发送端一致。
+        修改内容：M-RoPE 模型固定启用；关闭时同时跳过接收和 broadcast。
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
@@ -1296,7 +1301,8 @@ def edge_cloud_broadcast_recv(
             if key in merge_key_set:
                 continue  # covered by merged_buf
             if key == "mrope_positions" and not include_mrope:
-                # Sender omitted mrope for this text-only batch; mirror that
+                # 修改原因：兼容模式 sender 未发送 M-RoPE。
+                # 修改内容：接收侧分配阶段同步跳过该 tensor。
                 # on the recv side (do not allocate / broadcast-recv).
                 continue
             full_size = (recv_num_tokens,) + value.size[1:]
@@ -1339,7 +1345,8 @@ def edge_cloud_broadcast_recv(
     for key, value in metadata_list:
         if isinstance(value, TensorMetadata):
             if key == "mrope_positions" and not include_mrope:
-                # Sender omitted mrope for this text-only batch; skip.
+                # 修改原因：兼容模式 sender 未发送 M-RoPE。
+                # 修改内容：节点内 metadata broadcast 阶段同步跳过该 tensor。
                 continue
             # Replace placeholder dim-0 with the TP-padded size so the
             # intra-node broadcast matches the tensor allocated by PP NPU0.

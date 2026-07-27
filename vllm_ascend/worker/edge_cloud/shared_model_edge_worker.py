@@ -310,6 +310,23 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             _gathered = self.worker._all_gather_tensor_dict(hidden_k.tensors)
         else:
             _gathered = hidden_k.tensors
+        # 修改原因：边云两侧多模态 request state 的建立时机不同，动态决定是否
+        # 发送 M-RoPE 会造成收发 tensor key 集不一致；共享 staging buffer 还
+        # 可能被后续异步 prepare 覆盖。
+        # 修改内容：M-RoPE 模型固定使用含 position 的 wire schema，并从本 DP
+        # bundle 的不可变快照取值。
+        include_mrope = self.worker.model_runner.uses_mrope
+        if include_mrope and self.bundle.mrope_positions is None:
+            raise RuntimeError(
+                "M-RoPE virtual-DP bundle is missing its immutable "
+                "edge-to-cloud position snapshot."
+            )
+        self.worker._attach_mrope_positions(
+            _gathered,
+            include_mrope=include_mrope,
+            mrope_positions=self.bundle.mrope_positions,
+            num_tokens=self.bundle.num_actual_tokens,
+        )
         # Mirror ``execute_model``: use the edge-cloud-optimised isend
         # with explicit ``dst`` and ``num_tokens`` slicing so the
         # receiver can allocate buffers based on
@@ -320,6 +337,8 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             _gathered,
             dst=dp_rank + 1,
             num_tokens=num_tokens,
+            # 修改内容：发送端按固定 M-RoPE schema 选择 tensor key。
+            include_mrope=include_mrope,
         )
         edge_sp = enable_sp()
         edge_merge = get_edge_cloud_tensor_meta().merge_payload
@@ -521,6 +540,8 @@ class SharedModelEdgeWorker(NPUWorker):
         rank: int,
         distributed_init_method: str,
         is_driver_worker: bool = False,
+        # 修改内容：区分组内 local rank 与请求路由使用的 global DP rank。
+        global_dp_rank: int | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -531,17 +552,12 @@ class SharedModelEdgeWorker(NPUWorker):
             is_driver_worker=is_driver_worker,
             **kwargs,
         )
-        # ``SharedModelEdgeWorker`` is only valid in the
-        # shared-model edge-cloud topology: the worker must be on
-        # the edge side and the edge must have exactly one NPU
-        # (i.e. ``is_shared_model_edge`` is True). Using this
-        # worker on the cloud side, or on a multi-NPU edge, would
-        # silently produce incorrect PP routing.
+        # 修改原因：该 Worker 的进程内共享和 PP 路由语义只适用于共享 edge group。
+        # 修改内容：放宽“全局只能一张边卡”的旧限制，但仍拒绝非共享/云侧实例。
         if not vllm_config.parallel_config.is_shared_model_edge:
             raise RuntimeError(
                 "SharedModelEdgeWorker can only be used in the "
-                "shared-model edge-cloud topology "
-                "(edge_npu_count == 1 across the whole world). "
+                "shared-model edge-cloud topology. "
                 "The current parallel_config has "
                 f"is_shared_model_edge=False "
                 f"(edge_npu_count="
@@ -557,7 +573,15 @@ class SharedModelEdgeWorker(NPUWorker):
                 "edge-cloud configuration; the current process has "
                 "is_edge_node=False. Use a regular NPUWorker on the "
                 "cloud side.")
-        # local_rank doubles as the worker's dp_rank in this design.
+        self.global_dp_rank = (
+            local_rank if global_dp_rank is None else global_dp_rank
+        )
+        self.edge_group_id = (
+            vllm_config.parallel_config.edge_group_id(self.global_dp_rank)
+        )
+        # 修改原因：grouped_shared 中 local_rank 只是物理组内虚拟 DP 下标，
+        # 不能用于全局通信路由和诊断。
+        # 修改内容：同时保存 global DP rank、edge group id 和组内 local rank。
         self._is_leader: bool = (self.local_rank == 0)
         # Published by the leader in load_model; read by followers.
         self._shared_model: nn.Module | None = None
@@ -627,6 +651,10 @@ class SharedModelEdgeWorker(NPUWorker):
                     has_residual=has_residual,
                     hc_mult=hc_mult,
                     mode=self.model_runner.edge_cloud_cfg.mode,
+                    # 修改原因：M-RoPE 模型需要在初始化时把 position 纳入固定
+                    # edge-cloud tensor metadata。
+                    # 修改内容：把模型 uses_mrope 能力传给通信 metadata 初始化。
+                    uses_mrope=self.model_config.uses_mrope,
                 )
 
     # ----------------------------------------------- distributed env (leader)
@@ -634,11 +662,26 @@ class SharedModelEdgeWorker(NPUWorker):
         """Run the HCCL-backend distributed init once per process.
 
         Only the leader invokes the upstream machinery; followers inherit
-        the process-level distributed state.
+        the process-level distributed state. The process sees exactly one
+        physical edge NPU through the device-control environment, so its
+        device-local rank must remain zero even when the group leader's global
+        DP rank is non-zero (for example DP2 leading edge group 1).
         """
         if not self._is_leader:
             return
-        super()._init_worker_distributed_environment()
+        # 修改原因：物理 edge 进程只看见一张 NPU，设备局部 rank 必须是 0；
+        # grouped_shared 的组 leader 全局 DP 可能为 DP2，不能把 2 当设备号。
+        # 修改内容：仅在底层 distributed init 期间临时改为设备局部 0，随后恢复
+        # 虚拟 DP 配置供请求路由使用。
+        original_local_rank = self.parallel_config.data_parallel_rank_local
+        original_index = self.parallel_config.data_parallel_index
+        try:
+            self.parallel_config.data_parallel_rank_local = 0
+            self.parallel_config.data_parallel_index = 0
+            super()._init_worker_distributed_environment()
+        finally:
+            self.parallel_config.data_parallel_rank_local = original_local_rank
+            self.parallel_config.data_parallel_index = original_index
 
     # --------------------------------------------------------- model load
     def load_model(self) -> None:
@@ -662,13 +705,70 @@ class SharedModelEdgeWorker(NPUWorker):
                     "in local_rank order so the leader's load_model runs "
                     "before any follower's."
                 )
-            self.model_runner.bind_to_shared_model(leader._shared_model)
+            # 修改原因：follower 不加载模型，仅赋值 model 对象不足以恢复自定义
+            # 算子的 static forward context。
+            # 修改内容：绑定 leader 模型时同步传递 leader compilation config。
+            self.model_runner.bind_to_shared_model(
+                leader._shared_model,
+                source_compilation_config=(
+                    leader.model_runner.compilation_config
+                ),
+            )
             self._shared_model = leader._shared_model
             # Inherit the leader's measured model memory usage so that
             # determine_available_memory can correctly subtract the
             # shared weight footprint.
             self.model_runner.model_memory_usage = (
                 leader.model_runner.model_memory_usage)
+
+    def _attach_mrope_positions(
+        self,
+        tensors: dict[str, Any],
+        *,
+        include_mrope: bool,
+        mrope_positions: torch.Tensor | None = None,
+        num_tokens: int | None = None,
+    ) -> None:
+        """把边侧计算的 M-RoPE position 加入 edge-to-cloud payload。
+
+        修改原因：云侧没有边侧 request state 中的 image/video grid，无法可靠
+        重算多模态 M-RoPE；发送 tensor 的 dim-0 又必须统一表示 token 维。
+        修改内容：优先使用 bundle 快照，否则从 runner 复制并转成 [N,3]；
+        校验长度后按真实 token 数裁剪。
+        """
+        if (
+            include_mrope
+            and self.model_runner.uses_mrope
+            and "hidden_states" in tensors
+        ):
+            if num_tokens is None:
+                num_tokens = tensors["hidden_states"].shape[0]
+            if mrope_positions is None:
+                mrope_positions = (
+                    self.model_runner.mrope_positions.gpu[
+                        :, :num_tokens
+                    ].t().contiguous()
+                )
+            if mrope_positions.shape[0] < num_tokens:
+                raise RuntimeError(
+                    "M-RoPE snapshot is shorter than the edge payload: "
+                    f"positions={mrope_positions.shape[0]}, "
+                    f"hidden_states={num_tokens}."
+                )
+            tensors["mrope_positions"] = mrope_positions[:num_tokens]
+
+    def _wait_for_pp_send_work(self) -> None:
+        """在设备同步前等待尚未完成的 edge-to-cloud send。
+
+        修改原因：同步采样会触发 NPU stream 同步；若上一阶段 HCCL isend handle
+        仍悬空，采样和通信可能形成等待环。
+        修改内容：在 execute/sample 边界显式 wait 全部 handle 并清空列表。
+        """
+        if not self._pp_send_work:
+            return
+        for handle in self._pp_send_work:
+            handle.wait()
+        self._pp_send_work = []
 
     # ------------------------------------------------- execute_model / PP
     def execute_model(
@@ -711,10 +811,9 @@ class SharedModelEdgeWorker(NPUWorker):
             )
             dp.step()
 
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        # 修改内容：用统一 helper 替代重复 wait/clear 代码，确保 execute 边界
+        # 完成上一轮发送。
+        self._wait_for_pp_send_work()
 
         # SharedModelEdgeWorker always sits at PP rank 0 (the edge is
         # the first stage of the shared PP group), so there is no
@@ -737,6 +836,14 @@ class SharedModelEdgeWorker(NPUWorker):
             _gathered = self._all_gather_tensor_dict(output.tensors)
         else:
             _gathered = output.tensors
+        # 修改原因：普通 stateful 路径也必须与 batched 路径使用相同固定协议。
+        # 修改内容：所有 M-RoPE 模型 step 都附加真实 token 范围的 position。
+        include_mrope = self.model_runner.uses_mrope
+        self._attach_mrope_positions(
+            _gathered,
+            include_mrope=include_mrope,
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+        )
         # Send the head-layer output to the cloud first-worker of
         # ``local_rank``'s dp_rank (in-group rank
         # ``self.local_rank + 1``). The explicit ``dst=`` is required
@@ -747,6 +854,8 @@ class SharedModelEdgeWorker(NPUWorker):
             _gathered,
             dst=self.local_rank + 1,
             num_tokens=scheduler_output.total_num_scheduled_tokens,
+            # 修改内容：stateful 路径发送端也使用固定 M-RoPE schema。
+            include_mrope=include_mrope,
         )
 
         edge_sp = enable_sp()
@@ -792,6 +901,38 @@ class SharedModelEdgeWorker(NPUWorker):
 
         return DeferredExecutePostprocess(postprocess=_tail_postprocess)
 
+    @torch.inference_mode()
+    def sample_tokens(
+        self,
+        grammar_output: "GrammarOutput",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        # 修改原因：sample_tokens 可能同步 NPU，必须先完成上一阶段 PP send。
+        # 修改内容：采样入口统一等待并清理发送 handle。
+        self._wait_for_pp_send_work()
+        return super().sample_tokens(grammar_output)
+
+    def should_use_batched_execute(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        """选择当前 step 是否进入虚拟 DP 合批路径。
+
+        修改原因：纯文本及 decoder-only M-RoPE 多模态模型已能在 bundle 中完整
+        携带 inputs_embeds、attention metadata 和 position；其他多模态架构
+        可能还有未建模的专用 forward 参数。
+        修改内容：文本始终合批；仅允许已验证的 M-RoPE decoder-only 多模态
+        模型合批，其余回退 stateful execute_model。
+        """
+        if not self.model_runner.step_has_multimodal_req(
+            scheduler_output
+        ):
+            return True
+        return (
+            self.model_runner.supports_mm_inputs
+            and self.model_runner.uses_mrope
+            and not self.model_config.is_encoder_decoder
+        )
+
     # ------------------------------------------------- batched path entry
     def execute_model_batched_pre(
         self,
@@ -828,10 +969,10 @@ class SharedModelEdgeWorker(NPUWorker):
                 dynamic_profile as dp,
             )
             dp.step()
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        # 修改原因：下一轮 batched prepare 前必须结束上一轮的异步 PP send，
+        # 防止重用通信 buffer 或在后续同步点卡死。
+        # 修改内容：batched post 边界统一等待发送完成。
+        self._wait_for_pp_send_work()
         if self.profiler is not None:
             self.profiler.step()
 
@@ -906,11 +1047,14 @@ class SharedModelEdgeWorker(NPUWorker):
                 return w._per_worker_kv_cache_memory
 
         # Slow path: we are the first caller. Do the actual
-        # profiling and divide by dp_size.
+        # 修改原因：显存/KV 预算只在当前物理 edge group 的虚拟 Worker 间共享，
+        # 使用全局 DP 数会在 grouped_shared 中重复缩小预算。
+        # 修改内容：按 dp_ranks_per_edge_group 均分本卡可用预算。
+        group_size = self.parallel_config.dp_ranks_per_edge_group
         if self.cache_config.kv_cache_memory_bytes:
             self._per_worker_kv_cache_memory = int(
                 self.cache_config.kv_cache_memory_bytes
-                // self.parallel_config.data_parallel_size)
+                // group_size)
             return self._per_worker_kv_cache_memory
 
         from vllm.utils.mem_utils import memory_profiling
@@ -933,8 +1077,9 @@ class SharedModelEdgeWorker(NPUWorker):
             raise RuntimeError(
                 "Error in memory profiling: free memory increased.")
         available = int(self.requested_memory - result.non_kv_cache_memory)
+        # 修改内容：动态 profiling 得到的剩余显存同样只按组内虚拟 DP 数均分。
         self._per_worker_kv_cache_memory = (
-            available // self.parallel_config.data_parallel_size)
+            available // group_size)
         # For embedding_only edge, the edge device does not actually store KV
         # cache tensors. Return a very large virtual value so that
         # get_kv_cache_configs() does not clamp num_blocks to the edge's
