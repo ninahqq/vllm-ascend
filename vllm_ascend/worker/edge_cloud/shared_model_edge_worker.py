@@ -313,6 +313,15 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             _gathered = self.worker._all_gather_tensor_dict(hidden_k.tensors)
         else:
             _gathered = hidden_k.tensors
+        include_mrope = (
+            self.worker.model_runner.step_has_multimodal_req(
+                self.bundle.scheduler_output
+            )
+        )
+        self.worker._attach_mrope_positions(
+            _gathered,
+            include_mrope=include_mrope,
+        )
         # Mirror ``execute_model``: use the edge-cloud-optimised isend
         # with explicit ``dst`` and ``num_tokens`` slicing so the
         # receiver can allocate buffers based on
@@ -323,6 +332,7 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             _gathered,
             dst=dp_rank + 1,
             num_tokens=num_tokens,
+            include_mrope=include_mrope,
         )
         edge_sp = enable_sp()
         edge_merge = get_edge_cloud_tensor_meta().merge_payload
@@ -631,6 +641,9 @@ class SharedModelEdgeWorker(NPUWorker):
                     has_residual=has_residual,
                     hc_mult=hc_mult,
                     mode=self.model_runner.edge_cloud_cfg.mode,
+                    # 中文说明：多模态模型需要在边云通信元数据中固定声明
+                    # mrope_positions，保证边侧发送与云侧接收的字段集合一致。
+                    uses_mrope=self.model_config.uses_mrope,
                     # Must match the cloud side (worker.py), otherwise the
                     # e2c/c2e wire payload sizes disagree and HCCL send/recv
                     # fails with mismatched parameter count. Materialized
@@ -698,6 +711,48 @@ class SharedModelEdgeWorker(NPUWorker):
             self.model_runner.model_memory_usage = (
                 leader.model_runner.model_memory_usage)
 
+    def _attach_mrope_positions(
+        self,
+        tensors: dict[str, Any],
+        *,
+        include_mrope: bool,
+    ) -> None:
+        """Attach edge-computed M-RoPE positions to an e2c payload.
+
+        The cloud cannot recompute multimodal M-RoPE because the image/video
+        grid metadata is owned by the edge request state. Keep the wire layout
+        consistent with the regular NPUWorker path: transpose the runner's
+        ``[3, N]`` positions buffer to sequence-major ``[N, 3]`` so the
+        edge-cloud sender can slice every payload tensor by ``num_tokens``.
+        """
+        if (
+            include_mrope
+            and self.model_runner.uses_mrope
+            and "hidden_states" in tensors
+        ):
+            num_tokens = tensors["hidden_states"].shape[0]
+            tensors["mrope_positions"] = (
+                self.model_runner.mrope_positions.gpu[
+                    :, :num_tokens
+                ].t().contiguous()
+            )
+
+    def _wait_for_pp_send_work(self) -> None:
+        """Complete outstanding edge-to-cloud sends before device syncs.
+
+        Synchronous sampling copies sampled token IDs back to the CPU and can
+        therefore synchronize the NPU stream. The shared batched path launches
+        raw HCCL ``isend`` operations during ``execute_model``; leaving their
+        work handles pending until the next execute step can make that sampling
+        synchronization wait indefinitely. Complete and clear the sends at the
+        execute/sample boundary instead.
+        """
+        if not self._pp_send_work:
+            return
+        for handle in self._pp_send_work:
+            handle.wait()
+        self._pp_send_work = []
+
     # ------------------------------------------------- execute_model / PP
     def execute_model(
         self,
@@ -739,10 +794,7 @@ class SharedModelEdgeWorker(NPUWorker):
             )
             dp.step()
 
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        self._wait_for_pp_send_work()
 
         # SharedModelEdgeWorker always sits at PP rank 0 (the edge is
         # the first stage of the shared PP group), so there is no
@@ -765,6 +817,13 @@ class SharedModelEdgeWorker(NPUWorker):
             _gathered = self._all_gather_tensor_dict(output.tensors)
         else:
             _gathered = output.tensors
+        include_mrope = self.model_runner.step_has_multimodal_req(
+            scheduler_output
+        )
+        self._attach_mrope_positions(
+            _gathered,
+            include_mrope=include_mrope,
+        )
         # Send the head-layer output to the cloud first-worker of
         # ``local_rank``'s dp_rank (in-group rank
         # ``self.local_rank + 1``). The explicit ``dst=`` is required
@@ -775,6 +834,7 @@ class SharedModelEdgeWorker(NPUWorker):
             _gathered,
             dst=self.local_rank + 1,
             num_tokens=scheduler_output.total_num_scheduled_tokens,
+            include_mrope=include_mrope,
         )
 
         edge_sp = enable_sp()
@@ -820,6 +880,28 @@ class SharedModelEdgeWorker(NPUWorker):
 
         return DeferredExecutePostprocess(postprocess=_tail_postprocess)
 
+    @torch.inference_mode()
+    def sample_tokens(
+        self,
+        grammar_output: "GrammarOutput",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        self._wait_for_pp_send_work()
+        return super().sample_tokens(grammar_output)
+
+    def should_use_batched_execute(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        """Return whether this step is safe for virtual-DP batching.
+
+        Multimodal requests keep visual-encoder cache and M-RoPE state in the
+        owning virtual worker. The current merged head/tail implementation
+        cannot safely merge that state, so route the complete lifetime of a
+        multimodal request through the stateful ``execute_model`` path.
+        """
+        return not self.model_runner.step_has_multimodal_req(
+            scheduler_output)
+
     # ------------------------------------------------- batched path entry
     def execute_model_batched_pre(
         self,
@@ -856,10 +938,7 @@ class SharedModelEdgeWorker(NPUWorker):
                 dynamic_profile as dp,
             )
             dp.step()
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        self._wait_for_pp_send_work()
         if self.profiler is not None:
             self.profiler.step()
 

@@ -4062,6 +4062,13 @@ class NPUModelRunner(GPUModelRunner):
         on edge and cloud (they share the scheduler_output and build req_state
         from the same NewRequestData.mm_features).
         """
+        # This is the scheduler-owned, transport-stable signal that the step
+        # runs a multimodal encoder input. Prefer it over worker-local feature
+        # payloads: mm_features may be replaced by an IPC-cache reference (or
+        # stripped from a downstream worker's copy), while
+        # scheduled_encoder_inputs remains identical on edge and cloud.
+        if scheduler_output.scheduled_encoder_inputs:
+            return True
         # cached/running reqs: covers decode of multimodal requests (whose
         # mm_features stay non-empty after prefill).
         if any(rs.mm_features for rs in self.requests.values()):
