@@ -767,10 +767,9 @@ def edge_cloud_isend_tensor_dict(
             previous behavior for callers that already guarantee unpadded
             output.
         include_mrope: when False, omit ``mrope_positions`` from the wire
-            payload (text-only batches compute M-RoPE locally on the cloud,
-            so transferring it would waste a P2P RTT). The caller on both
-            sides must pass the same value (derived from
-            step_has_multimodal_req) so sender/receiver agree on the key set.
+            payload. Edge-cloud workers keep this True for M-RoPE models so
+            every step uses a fixed schema; compatibility callers may disable
+            it only when sender and receiver are configured identically.
     """
     pp_group = get_pp_group()
     if pp_group.world_size <= 1:
@@ -790,10 +789,9 @@ def edge_cloud_isend_tensor_dict(
     # mismatch would corrupt data silently or only surface as an HCCL
     # crash. Fail fast here with a precise message instead.
     ec_meta = _select_edge_cloud_meta_for_send()
-    # Dynamic send key set: drop mrope_positions when the caller signals a
-    # text-only batch (include_mrope=False). Both sides derive include_mrope
-    # from the same step_has_multimodal_req(scheduler_output), so sender and
-    # receiver agree on whether mrope is on the wire.
+    # The edge-cloud workers use a fixed key set for M-RoPE models. The
+    # include_mrope switch remains for non-M-RoPE callers and compatibility,
+    # but must be configured symmetrically by sender and receiver.
     meta_send_keys = ec_meta.send_tensor_keys or ec_meta.tensor_keys
     send_keys = [
         k for k in meta_send_keys
@@ -1088,7 +1086,8 @@ def edge_cloud_irecv_tensor_dict(
         if key in merge_key_set:
             continue  # already covered by the merged buffer
         if key == "mrope_positions" and not include_mrope:
-            # Sender omitted mrope for this text-only batch; do not allocate
+            # Sender omitted mrope for this compatibility-mode transfer; do
+            # not allocate
             # or irecv it (cloud computes M-RoPE locally).
             continue
         # Replace the placeholder dim-0 with the TP-padded size; the
@@ -1200,8 +1199,8 @@ def edge_cloud_broadcast_recv(
             branch is unchanged.
 
     include_mrope: must match the sender's edge_cloud_isend_tensor_dict
-    argument (both derived from step_has_multimodal_req). When False,
-    mrope_positions is neither received nor broadcast (text-only batch).
+    argument. Edge-cloud workers keep it enabled for M-RoPE models; when
+    False, mrope_positions is neither received nor broadcast.
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
@@ -1314,7 +1313,8 @@ def edge_cloud_broadcast_recv(
             if key in merge_key_set:
                 continue  # covered by merged_buf
             if key == "mrope_positions" and not include_mrope:
-                # Sender omitted mrope for this text-only batch; mirror that
+                # Sender omitted mrope for this compatibility-mode transfer;
+                # mirror that
                 # on the recv side (do not allocate / broadcast-recv).
                 continue
             full_size = (recv_num_tokens,) + value.size[1:]
@@ -1357,7 +1357,8 @@ def edge_cloud_broadcast_recv(
     for key, value in metadata_list:
         if isinstance(value, TensorMetadata):
             if key == "mrope_positions" and not include_mrope:
-                # Sender omitted mrope for this text-only batch; skip.
+                # Sender omitted mrope for this compatibility-mode transfer;
+                # skip.
                 continue
             # Replace placeholder dim-0 with the TP-padded size so the
             # intra-node broadcast matches the tensor allocated by PP NPU0.

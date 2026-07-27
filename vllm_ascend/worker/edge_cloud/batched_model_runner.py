@@ -893,11 +893,20 @@ class BatchedModelRunner(NPUModelRunner):
                 "_build_attn_group_metadata (via "
                 "_should_save_for_attn_metadata=True).")
         common_attn_metadata = cm_base
+        mrope_positions = None
+        if self.uses_mrope:
+            num_actual_tokens = scheduler_output.total_num_scheduled_tokens
+            mrope_positions = (
+                self.mrope_positions.gpu[
+                    :, :num_actual_tokens
+                ].t().contiguous()
+            )
 
         return _ExecuteModelBundle(
             input_ids=input_ids,
             positions=positions,
             inputs_embeds=inputs_embeds,
+            mrope_positions=mrope_positions,
             intermediate_tensors=None,
             hidden_states=None,
             logits_indices=logits_indices,
@@ -920,6 +929,46 @@ class BatchedModelRunner(NPUModelRunner):
                 deferred_state_corrections_fn),
         )
 
+    @staticmethod
+    def _validate_batched_forward_inputs(
+        bundles: list[_ExecuteModelBundle],
+    ) -> None:
+        """Reject input layouts that cannot share one model forward."""
+        if not bundles:
+            raise RuntimeError(
+                "Virtual-DP batched forward requires at least one bundle."
+            )
+
+        input_kinds = {
+            (
+                "embeds"
+                if bundle.inputs_embeds is not None
+                else "ids"
+                if bundle.input_ids is not None
+                else "missing"
+            )
+            for bundle in bundles
+        }
+        if len(input_kinds) != 1 or "missing" in input_kinds:
+            raise RuntimeError(
+                "Virtual-DP batched forward received incompatible input "
+                f"kinds: {sorted(input_kinds)}."
+            )
+
+        position_dims = {
+            bundle.positions.dim()
+            for bundle in bundles
+            if bundle.positions is not None
+        }
+        if (
+            len(position_dims) != 1
+            or any(bundle.positions is None for bundle in bundles)
+        ):
+            raise RuntimeError(
+                "Virtual-DP batched forward received incompatible position "
+                f"layouts: dims={sorted(position_dims)}."
+            )
+
     @torch.inference_mode()
     def execute_model_batched_head(
         self,
@@ -938,6 +987,8 @@ class BatchedModelRunner(NPUModelRunner):
         ``self.max_num_tokens`` in the ``embedding_only`` mode so
         that the cloud's pre-allocated buffer is large enough.
         """
+        self._validate_batched_forward_inputs(bundles)
+
         # Per-bundle actual (non-padded) token counts.
         n_actuals = [b.num_actual_tokens for b in bundles]
 

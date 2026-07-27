@@ -313,14 +313,22 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             _gathered = self.worker._all_gather_tensor_dict(hidden_k.tensors)
         else:
             _gathered = hidden_k.tensors
-        include_mrope = (
-            self.worker.model_runner.step_has_multimodal_req(
-                self.bundle.scheduler_output
+        # M-RoPE models use a fixed edge->cloud wire schema for every step.
+        # This avoids sender/receiver protocol drift when multimodal request
+        # state is represented differently on the two sides. The bundle owns
+        # an immutable snapshot so a later async prepare cannot overwrite the
+        # positions before this send is launched.
+        include_mrope = self.worker.model_runner.uses_mrope
+        if include_mrope and self.bundle.mrope_positions is None:
+            raise RuntimeError(
+                "M-RoPE virtual-DP bundle is missing its immutable "
+                "edge-to-cloud position snapshot."
             )
-        )
         self.worker._attach_mrope_positions(
             _gathered,
             include_mrope=include_mrope,
+            mrope_positions=self.bundle.mrope_positions,
+            num_tokens=self.bundle.num_actual_tokens,
         )
         # Mirror ``execute_model``: use the edge-cloud-optimised isend
         # with explicit ``dst`` and ``num_tokens`` slicing so the
@@ -716,6 +724,8 @@ class SharedModelEdgeWorker(NPUWorker):
         tensors: dict[str, Any],
         *,
         include_mrope: bool,
+        mrope_positions: torch.Tensor | None = None,
+        num_tokens: int | None = None,
     ) -> None:
         """Attach edge-computed M-RoPE positions to an e2c payload.
 
@@ -730,12 +740,21 @@ class SharedModelEdgeWorker(NPUWorker):
             and self.model_runner.uses_mrope
             and "hidden_states" in tensors
         ):
-            num_tokens = tensors["hidden_states"].shape[0]
-            tensors["mrope_positions"] = (
-                self.model_runner.mrope_positions.gpu[
-                    :, :num_tokens
-                ].t().contiguous()
-            )
+            if num_tokens is None:
+                num_tokens = tensors["hidden_states"].shape[0]
+            if mrope_positions is None:
+                mrope_positions = (
+                    self.model_runner.mrope_positions.gpu[
+                        :, :num_tokens
+                    ].t().contiguous()
+                )
+            if mrope_positions.shape[0] < num_tokens:
+                raise RuntimeError(
+                    "M-RoPE snapshot is shorter than the edge payload: "
+                    f"positions={mrope_positions.shape[0]}, "
+                    f"hidden_states={num_tokens}."
+                )
+            tensors["mrope_positions"] = mrope_positions[:num_tokens]
 
     def _wait_for_pp_send_work(self) -> None:
         """Complete outstanding edge-to-cloud sends before device syncs.
@@ -817,12 +836,11 @@ class SharedModelEdgeWorker(NPUWorker):
             _gathered = self._all_gather_tensor_dict(output.tensors)
         else:
             _gathered = output.tensors
-        include_mrope = self.model_runner.step_has_multimodal_req(
-            scheduler_output
-        )
+        include_mrope = self.model_runner.uses_mrope
         self._attach_mrope_positions(
             _gathered,
             include_mrope=include_mrope,
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
         )
         # Send the head-layer output to the cloud first-worker of
         # ``local_rank``'s dp_rank (in-group rank
@@ -892,15 +910,25 @@ class SharedModelEdgeWorker(NPUWorker):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> bool:
-        """Return whether this step is safe for virtual-DP batching.
+        """Use the virtual-DP batched path for text and multimodal steps.
 
-        Multimodal requests keep visual-encoder cache and M-RoPE state in the
-        owning virtual worker. The current merged head/tail implementation
-        cannot safely merge that state, so route the complete lifetime of a
-        multimodal request through the stateful ``execute_model`` path.
+        ``execute_model_batched_pre`` runs on the owning virtual worker, so
+        request and encoder-cache state remain isolated per DP. The resulting
+        bundle carries the actual input embeddings, attention metadata and an
+        immutable M-RoPE snapshot into the shared head/tail forward. Limit
+        multimodal batching to decoder-only M-RoPE models for now: other
+        multimodal architectures can require model-specific forward kwargs
+        that are not represented by ``_ExecuteModelBundle`` yet.
         """
-        return not self.model_runner.step_has_multimodal_req(
-            scheduler_output)
+        if not self.model_runner.step_has_multimodal_req(
+            scheduler_output
+        ):
+            return True
+        return (
+            self.model_runner.supports_mm_inputs
+            and self.model_runner.uses_mrope
+            and not self.model_config.is_encoder_decoder
+        )
 
     # ------------------------------------------------- batched path entry
     def execute_model_batched_pre(

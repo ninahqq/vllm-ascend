@@ -2769,8 +2769,8 @@ class NPUModelRunner(GPUModelRunner):
             if (self._edge_cloud_enabled
                     and self.edge_cloud_cfg.role == "cloud"
                     and self.uses_mrope
-                    and self.step_has_multimodal_req(scheduler_output)
-                    and recv_intermediate_tensors is not None):
+                    and recv_intermediate_tensors is not None
+                    and "mrope_positions" in recv_intermediate_tensors.tensors):
                 recv_intermediate_tensors.wait_for_comm()
                 recv_mrope = recv_intermediate_tensors.tensors["mrope_positions"]
                 self.mrope_positions.gpu[:, :num_tokens_padded].copy_(
@@ -4055,12 +4055,9 @@ class NPUModelRunner(GPUModelRunner):
     def step_has_multimodal_req(self, scheduler_output) -> bool:
         """Whether the current step's batch contains any multimodal request.
 
-        Used to decide whether mrope_positions must be transferred edge->cloud
-        (only multimodal requests need it; text-only batches can be computed
-        locally on the cloud because empty mm_features degrades M-RoPE to 1D
-        without hitting the missing image_grid_thw). Must return the SAME value
-        on edge and cloud (they share the scheduler_output and build req_state
-        from the same NewRequestData.mm_features).
+        Used to classify virtual-DP steps and decide whether cloud-side M-RoPE
+        can be computed locally. The edge-cloud wire schema itself is fixed
+        for M-RoPE models and does not depend on this predicate.
         """
         # This is the scheduler-owned, transport-stable signal that the step
         # runs a multimodal encoder input. Prefer it over worker-local feature
@@ -4069,10 +4066,13 @@ class NPUModelRunner(GPUModelRunner):
         # scheduled_encoder_inputs remains identical on edge and cloud.
         if scheduler_output.scheduled_encoder_inputs:
             return True
-        # cached/running reqs: covers decode of multimodal requests (whose
-        # mm_features stay non-empty after prefill).
-        if any(rs.mm_features for rs in self.requests.values()):
-            return True
+        # Cached/running requests: inspect only requests scheduled in this
+        # step. Looking at every resident request makes an unrelated
+        # multimodal request classify a text-only step as multimodal.
+        for req_id in getattr(scheduler_output, "num_scheduled_tokens", {}):
+            req_state = self.requests.get(req_id)
+            if req_state is not None and req_state.mm_features:
+                return True
         # new reqs this step: cloud recv runs BEFORE cloud_prepare_early builds
         # req_state, so on the cloud side self.requests does not yet contain
         # this step's new reqs; check scheduler_output directly.
@@ -4086,8 +4086,7 @@ class NPUModelRunner(GPUModelRunner):
         # requests (their image_grid_thw / video_grid_thw did not cross the
         # edge->cloud mm_features boundary, so local init would KeyError).
         # Text-only requests (empty mm_features) init locally: _iter_mm_grid_hw
-        # does not enter its loop, M-RoPE degrades to 1D, no crash. This lets
-        # text-only batches skip the mrope transfer entirely.
+        # does not enter its loop and M-RoPE degrades to 1D.
         # profile_run / _dummy_run do not call this, so the role guard does not
         # affect profiling.
         if (self._edge_cloud_enabled
