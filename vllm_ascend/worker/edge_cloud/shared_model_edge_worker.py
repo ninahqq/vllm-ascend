@@ -313,6 +313,23 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             _gathered = self.worker._all_gather_tensor_dict(hidden_k.tensors)
         else:
             _gathered = hidden_k.tensors
+        # M-RoPE models use a fixed edge->cloud wire schema for every step.
+        # This avoids sender/receiver protocol drift when multimodal request
+        # state is represented differently on the two sides. The bundle owns
+        # an immutable snapshot so a later async prepare cannot overwrite the
+        # positions before this send is launched.
+        include_mrope = self.worker.model_runner.uses_mrope
+        if include_mrope and self.bundle.mrope_positions is None:
+            raise RuntimeError(
+                "M-RoPE virtual-DP bundle is missing its immutable "
+                "edge-to-cloud position snapshot."
+            )
+        self.worker._attach_mrope_positions(
+            _gathered,
+            include_mrope=include_mrope,
+            mrope_positions=self.bundle.mrope_positions,
+            num_tokens=self.bundle.num_actual_tokens,
+        )
         # Mirror ``execute_model``: use the edge-cloud-optimised isend
         # with explicit ``dst`` and ``num_tokens`` slicing so the
         # receiver can allocate buffers based on
@@ -323,6 +340,7 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             _gathered,
             dst=dp_rank + 1,
             num_tokens=num_tokens,
+            include_mrope=include_mrope,
         )
         edge_sp = enable_sp()
         edge_merge = get_edge_cloud_tensor_meta().merge_payload
@@ -524,6 +542,7 @@ class SharedModelEdgeWorker(NPUWorker):
         rank: int,
         distributed_init_method: str,
         is_driver_worker: bool = False,
+        global_dp_rank: int | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -534,17 +553,11 @@ class SharedModelEdgeWorker(NPUWorker):
             is_driver_worker=is_driver_worker,
             **kwargs,
         )
-        # ``SharedModelEdgeWorker`` is only valid in the
-        # shared-model edge-cloud topology: the worker must be on
-        # the edge side and the edge must have exactly one NPU
-        # (i.e. ``is_shared_model_edge`` is True). Using this
-        # worker on the cloud side, or on a multi-NPU edge, would
-        # silently produce incorrect PP routing.
+        # ``SharedModelEdgeWorker`` is valid only on a shared edge group.
         if not vllm_config.parallel_config.is_shared_model_edge:
             raise RuntimeError(
                 "SharedModelEdgeWorker can only be used in the "
-                "shared-model edge-cloud topology "
-                "(edge_npu_count == 1 across the whole world). "
+                "shared-model edge-cloud topology. "
                 "The current parallel_config has "
                 f"is_shared_model_edge=False "
                 f"(edge_npu_count="
@@ -560,7 +573,13 @@ class SharedModelEdgeWorker(NPUWorker):
                 "edge-cloud configuration; the current process has "
                 "is_edge_node=False. Use a regular NPUWorker on the "
                 "cloud side.")
-        # local_rank doubles as the worker's dp_rank in this design.
+        self.global_dp_rank = (
+            local_rank if global_dp_rank is None else global_dp_rank
+        )
+        self.edge_group_id = (
+            vllm_config.parallel_config.edge_group_id(self.global_dp_rank)
+        )
+        # local_rank is the virtual rank within this physical edge group.
         self._is_leader: bool = (self.local_rank == 0)
         # Published by the leader in load_model; read by followers.
         self._shared_model: nn.Module | None = None
@@ -630,6 +649,9 @@ class SharedModelEdgeWorker(NPUWorker):
                     has_residual=has_residual,
                     hc_mult=hc_mult,
                     mode=self.model_runner.edge_cloud_cfg.mode,
+                    # 中文说明：多模态模型需要在边云通信元数据中固定声明
+                    # mrope_positions，保证边侧发送与云侧接收的字段集合一致。
+                    uses_mrope=self.model_config.uses_mrope,
                     # Must match the cloud side (worker.py), otherwise the
                     # e2c/c2e wire payload sizes disagree and HCCL send/recv
                     # fails with mismatched parameter count. Materialized
@@ -645,11 +667,22 @@ class SharedModelEdgeWorker(NPUWorker):
         """Run the HCCL-backend distributed init once per process.
 
         Only the leader invokes the upstream machinery; followers inherit
-        the process-level distributed state.
+        the process-level distributed state. The process sees exactly one
+        physical edge NPU through the device-control environment, so its
+        device-local rank must remain zero even when the group leader's global
+        DP rank is non-zero (for example DP2 leading edge group 1).
         """
         if not self._is_leader:
             return
-        super()._init_worker_distributed_environment()
+        original_local_rank = self.parallel_config.data_parallel_rank_local
+        original_index = self.parallel_config.data_parallel_index
+        try:
+            self.parallel_config.data_parallel_rank_local = 0
+            self.parallel_config.data_parallel_index = 0
+            super()._init_worker_distributed_environment()
+        finally:
+            self.parallel_config.data_parallel_rank_local = original_local_rank
+            self.parallel_config.data_parallel_index = original_index
 
     # --------------------------------------------------------- model load
     def load_model(self) -> None:
@@ -673,13 +706,71 @@ class SharedModelEdgeWorker(NPUWorker):
                     "in local_rank order so the leader's load_model runs "
                     "before any follower's."
                 )
-            self.model_runner.bind_to_shared_model(leader._shared_model)
+            self.model_runner.bind_to_shared_model(
+                leader._shared_model,
+                source_compilation_config=(
+                    leader.model_runner.compilation_config
+                ),
+            )
             self._shared_model = leader._shared_model
             # Inherit the leader's measured model memory usage so that
             # determine_available_memory can correctly subtract the
             # shared weight footprint.
             self.model_runner.model_memory_usage = (
                 leader.model_runner.model_memory_usage)
+
+    def _attach_mrope_positions(
+        self,
+        tensors: dict[str, Any],
+        *,
+        include_mrope: bool,
+        mrope_positions: torch.Tensor | None = None,
+        num_tokens: int | None = None,
+    ) -> None:
+        """Attach edge-computed M-RoPE positions to an e2c payload.
+
+        The cloud cannot recompute multimodal M-RoPE because the image/video
+        grid metadata is owned by the edge request state. Keep the wire layout
+        consistent with the regular NPUWorker path: transpose the runner's
+        ``[3, N]`` positions buffer to sequence-major ``[N, 3]`` so the
+        edge-cloud sender can slice every payload tensor by ``num_tokens``.
+        """
+        if (
+            include_mrope
+            and self.model_runner.uses_mrope
+            and "hidden_states" in tensors
+        ):
+            if num_tokens is None:
+                num_tokens = tensors["hidden_states"].shape[0]
+            if mrope_positions is None:
+                mrope_positions = (
+                    self.model_runner.mrope_positions.gpu[
+                        :, :num_tokens
+                    ].t().contiguous()
+                )
+            if mrope_positions.shape[0] < num_tokens:
+                raise RuntimeError(
+                    "M-RoPE snapshot is shorter than the edge payload: "
+                    f"positions={mrope_positions.shape[0]}, "
+                    f"hidden_states={num_tokens}."
+                )
+            tensors["mrope_positions"] = mrope_positions[:num_tokens]
+
+    def _wait_for_pp_send_work(self) -> None:
+        """Complete outstanding edge-to-cloud sends before device syncs.
+
+        Synchronous sampling copies sampled token IDs back to the CPU and can
+        therefore synchronize the NPU stream. The shared batched path launches
+        raw HCCL ``isend`` operations during ``execute_model``; leaving their
+        work handles pending until the next execute step can make that sampling
+        synchronization wait indefinitely. Complete and clear the sends at the
+        execute/sample boundary instead.
+        """
+        if not self._pp_send_work:
+            return
+        for handle in self._pp_send_work:
+            handle.wait()
+        self._pp_send_work = []
 
     # ------------------------------------------------- execute_model / PP
     def execute_model(
@@ -722,10 +813,7 @@ class SharedModelEdgeWorker(NPUWorker):
             )
             dp.step()
 
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        self._wait_for_pp_send_work()
 
         # SharedModelEdgeWorker always sits at PP rank 0 (the edge is
         # the first stage of the shared PP group), so there is no
@@ -748,6 +836,12 @@ class SharedModelEdgeWorker(NPUWorker):
             _gathered = self._all_gather_tensor_dict(output.tensors)
         else:
             _gathered = output.tensors
+        include_mrope = self.model_runner.uses_mrope
+        self._attach_mrope_positions(
+            _gathered,
+            include_mrope=include_mrope,
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+        )
         # Send the head-layer output to the cloud first-worker of
         # ``local_rank``'s dp_rank (in-group rank
         # ``self.local_rank + 1``). The explicit ``dst=`` is required
@@ -758,6 +852,7 @@ class SharedModelEdgeWorker(NPUWorker):
             _gathered,
             dst=self.local_rank + 1,
             num_tokens=scheduler_output.total_num_scheduled_tokens,
+            include_mrope=include_mrope,
         )
 
         edge_sp = enable_sp()
@@ -803,6 +898,38 @@ class SharedModelEdgeWorker(NPUWorker):
 
         return DeferredExecutePostprocess(postprocess=_tail_postprocess)
 
+    @torch.inference_mode()
+    def sample_tokens(
+        self,
+        grammar_output: "GrammarOutput",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        self._wait_for_pp_send_work()
+        return super().sample_tokens(grammar_output)
+
+    def should_use_batched_execute(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        """Use the virtual-DP batched path for text and multimodal steps.
+
+        ``execute_model_batched_pre`` runs on the owning virtual worker, so
+        request and encoder-cache state remain isolated per DP. The resulting
+        bundle carries the actual input embeddings, attention metadata and an
+        immutable M-RoPE snapshot into the shared head/tail forward. Limit
+        multimodal batching to decoder-only M-RoPE models for now: other
+        multimodal architectures can require model-specific forward kwargs
+        that are not represented by ``_ExecuteModelBundle`` yet.
+        """
+        if not self.model_runner.step_has_multimodal_req(
+            scheduler_output
+        ):
+            return True
+        return (
+            self.model_runner.supports_mm_inputs
+            and self.model_runner.uses_mrope
+            and not self.model_config.is_encoder_decoder
+        )
+
     # ------------------------------------------------- batched path entry
     def execute_model_batched_pre(
         self,
@@ -839,10 +966,7 @@ class SharedModelEdgeWorker(NPUWorker):
                 dynamic_profile as dp,
             )
             dp.step()
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        self._wait_for_pp_send_work()
         if self.profiler is not None:
             self.profiler.step()
 
@@ -917,11 +1041,13 @@ class SharedModelEdgeWorker(NPUWorker):
                 return w._per_worker_kv_cache_memory
 
         # Slow path: we are the first caller. Do the actual
-        # profiling and divide by dp_size.
+        # profiling and divide by the number of virtual DP workers sharing
+        # this physical edge NPU.
+        group_size = self.parallel_config.dp_ranks_per_edge_group
         if self.cache_config.kv_cache_memory_bytes:
             self._per_worker_kv_cache_memory = int(
                 self.cache_config.kv_cache_memory_bytes
-                // self.parallel_config.data_parallel_size)
+                // group_size)
             return self._per_worker_kv_cache_memory
 
         from vllm.utils.mem_utils import memory_profiling
@@ -945,7 +1071,7 @@ class SharedModelEdgeWorker(NPUWorker):
                 "Error in memory profiling: free memory increased.")
         available = int(self.requested_memory - result.non_kv_cache_memory)
         self._per_worker_kv_cache_memory = (
-            available // self.parallel_config.data_parallel_size)
+            available // group_size)
         # For embedding_only edge, the edge device does not actually store KV
         # cache tensors. Return a very large virtual value so that
         # get_kv_cache_configs() does not clamp num_blocks to the edge's

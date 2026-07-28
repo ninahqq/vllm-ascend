@@ -73,6 +73,12 @@ class _ExecuteModelBundle:
     input_ids: torch.Tensor | None
     positions: torch.Tensor | None
     inputs_embeds: torch.Tensor | None
+    # Immutable sequence-major M-RoPE snapshot for the edge->cloud wire
+    # payload. Unlike ``positions`` (which may be a view over a runner-owned
+    # staging buffer), this tensor owns the exact real-token range for the
+    # current virtual-DP step and therefore remains valid until the batched
+    # round has launched its PP send.
+    mrope_positions: torch.Tensor | None
     intermediate_tensors: IntermediateTensors | None
     hidden_states: torch.Tensor | None
 

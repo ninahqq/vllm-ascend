@@ -245,7 +245,7 @@ class BatchedModelRunner(NPUModelRunner):
             # the same for every virtual worker on the edge since
             # they all share the same NPU). The model_runner only
             # READS the registry here.
-            dp_size = self.parallel_config.data_parallel_size
+            dp_size = self.parallel_config.dp_ranks_per_edge_group
             if (len(
                     BatchedModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK)
                     < dp_size):
@@ -433,7 +433,11 @@ class BatchedModelRunner(NPUModelRunner):
             len(kv_cache_config_per_dp))
         return kv_caches
 
-    def bind_to_shared_model(self, model: nn.Module) -> None:
+    def bind_to_shared_model(
+        self,
+        model: nn.Module,
+        source_compilation_config: Any | None = None,
+    ) -> None:
         """Bind this runner to a model object loaded by another runner.
 
         Used by ``SharedModelEdgeWorker`` follower workers to share a single
@@ -454,9 +458,25 @@ class BatchedModelRunner(NPUModelRunner):
         - ensuring ``model`` has already been fully loaded by another
           runner in the same process (i.e. the leader
           ``SharedModelEdgeWorker``);
+        - passing the leader's ``CompilationConfig`` so that custom ops
+          resolve layer names against the same static forward context as
+          the shared model;
         - assigning ``self.model_memory_usage`` after binding, because only
           the leader's profile run actually measures it.
         """
+        if source_compilation_config is not None:
+            # Every virtual DP worker owns a deepcopy of VllmConfig, but only
+            # the leader constructs the model and populates these collections.
+            # The shared model's custom ops (GDN, attention, MoE, etc.) look up
+            # their modules through the current runner's forward context, so a
+            # follower must use the leader's collections as well.
+            self.compilation_config.static_forward_context = (
+                source_compilation_config.static_forward_context
+            )
+            self.compilation_config.static_all_moe_layers = (
+                source_compilation_config.static_all_moe_layers
+            )
+
         self.model = model
 
         # Edge-cloud specific state, derived from the (already sharded) model.
@@ -565,6 +585,10 @@ class BatchedModelRunner(NPUModelRunner):
         return num_tokens, None, cudagraph_mode
     # ------------------------------------------------------------------
     # Batched compute entry points
+    #
+    # These methods split NPUModelRunner.execute_model into independently
+    # dispatched phases. Each phase must therefore establish the inference
+    # mode that the original monolithic entry point provided.
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def execute_model_pre(
@@ -596,6 +620,32 @@ class BatchedModelRunner(NPUModelRunner):
         doesn't reuse the segment_e fast path — every round runs
         a fresh ``execute_model_pre``).
         """
+        # Capture the scheduler classification before any input-preparation
+        # helper can touch it. A cached request without runner state means an
+        # execute step was delivered to the wrong virtual DP worker (or ahead
+        # of its new-request step); letting the base implementation raise a
+        # bare KeyError hides the actual shared-worker routing fault.
+        new_req_ids = {
+            req_data.req_id
+            for req_data in scheduler_output.scheduled_new_reqs
+        }
+        cached_req_ids = set(
+            scheduler_output.scheduled_cached_reqs.req_ids)
+        missing_cached_req_ids = cached_req_ids - self.requests.keys()
+        if missing_cached_req_ids:
+            raise RuntimeError(
+                "Shared-model virtual DP request state is out of sync: "
+                f"global_dp_rank="
+                f"{self.parallel_config.data_parallel_rank}, "
+                f"local_dp_rank="
+                f"{self.parallel_config.data_parallel_rank_local}, "
+                f"missing_cached_req_ids={sorted(missing_cached_req_ids)}, "
+                f"new_req_ids={sorted(new_req_ids)}, "
+                f"cached_req_ids={sorted(cached_req_ids)}, "
+                f"known_req_ids={sorted(self.requests)}. "
+                "The cached execute step must be routed to the same virtual "
+                "worker that handled the request's new-request step.")
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -843,11 +893,20 @@ class BatchedModelRunner(NPUModelRunner):
                 "_build_attn_group_metadata (via "
                 "_should_save_for_attn_metadata=True).")
         common_attn_metadata = cm_base
+        mrope_positions = None
+        if self.uses_mrope:
+            num_actual_tokens = scheduler_output.total_num_scheduled_tokens
+            mrope_positions = (
+                self.mrope_positions.gpu[
+                    :, :num_actual_tokens
+                ].t().contiguous()
+            )
 
         return _ExecuteModelBundle(
             input_ids=input_ids,
             positions=positions,
             inputs_embeds=inputs_embeds,
+            mrope_positions=mrope_positions,
             intermediate_tensors=None,
             hidden_states=None,
             logits_indices=logits_indices,
@@ -870,6 +929,46 @@ class BatchedModelRunner(NPUModelRunner):
                 deferred_state_corrections_fn),
         )
 
+    @staticmethod
+    def _validate_batched_forward_inputs(
+        bundles: list[_ExecuteModelBundle],
+    ) -> None:
+        """Reject input layouts that cannot share one model forward."""
+        if not bundles:
+            raise RuntimeError(
+                "Virtual-DP batched forward requires at least one bundle."
+            )
+
+        input_kinds = {
+            (
+                "embeds"
+                if bundle.inputs_embeds is not None
+                else "ids"
+                if bundle.input_ids is not None
+                else "missing"
+            )
+            for bundle in bundles
+        }
+        if len(input_kinds) != 1 or "missing" in input_kinds:
+            raise RuntimeError(
+                "Virtual-DP batched forward received incompatible input "
+                f"kinds: {sorted(input_kinds)}."
+            )
+
+        position_dims = {
+            bundle.positions.dim()
+            for bundle in bundles
+            if bundle.positions is not None
+        }
+        if (
+            len(position_dims) != 1
+            or any(bundle.positions is None for bundle in bundles)
+        ):
+            raise RuntimeError(
+                "Virtual-DP batched forward received incompatible position "
+                f"layouts: dims={sorted(position_dims)}."
+            )
+
     @torch.inference_mode()
     def execute_model_batched_head(
         self,
@@ -888,6 +987,8 @@ class BatchedModelRunner(NPUModelRunner):
         ``self.max_num_tokens`` in the ``embedding_only`` mode so
         that the cloud's pre-allocated buffer is large enough.
         """
+        self._validate_batched_forward_inputs(bundles)
+
         # Per-bundle actual (non-padded) token counts.
         n_actuals = [b.num_actual_tokens for b in bundles]
 
@@ -1583,7 +1684,7 @@ class BatchedModelRunner(NPUModelRunner):
             AscendAttentionState,
         )
 
-        dp_size = self.parallel_config.data_parallel_size
+        dp_size = self.parallel_config.dp_ranks_per_edge_group
         bs = self.block_size
         num_kv_cache_gids = len(self.kv_cache_config.kv_cache_groups)
 
@@ -2423,4 +2524,3 @@ class BatchedModelRunner(NPUModelRunner):
         )
         self._merged_attn_ctx_cache = ctx
         return ctx
-
